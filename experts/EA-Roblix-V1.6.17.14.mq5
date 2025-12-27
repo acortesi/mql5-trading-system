@@ -629,6 +629,8 @@ void OnDeinit(const int reason) {
 
 // ManageTrailingStop (simplificado)
 void ManageTrailingStop(bool hasBuySignalFromRoblix, bool hasSellSignalFromRoblix) {
+    (void)hasBuySignalFromRoblix;
+    (void)hasSellSignalFromRoblix;
     if(!g_has_active_trade) return;
     if(!PositionSelectByTicket(g_current_trade.ticket)) { if(InpDebugMode) Print("ManageTS: position not found"); ProcessTradeClosure(); return; }
     ENUM_POSITION_TYPE pos_type = (ENUM_POSITION_TYPE)PositionGetInteger(POSITION_TYPE);
@@ -642,30 +644,23 @@ void ManageTrailingStop(bool hasBuySignalFromRoblix, bool hasSellSignalFromRobli
     double effective_trailing_stop_points = InpTrailingStopPriceUnits;
     double effective_trailing_step_points = InpTrailingStepPriceUnits;
     if(InpUseATRForRiskManagement && g_current_atr_value>0) {
-        double atr = g_current_atr_value;
-        effective_be_points = MathMax(effective_be_points, atr * InpATR_BE_Profit_Multiplier);
-        effective_be_offset_points = MathMax(effective_be_offset_points, atr * InpATR_BE_Offset_Multiplier);
-        effective_trailing_stop_points = MathMax(effective_trailing_stop_points, atr * InpATR_TS_Distance_Multiplier);
-        effective_trailing_step_points = MathMax(effective_trailing_step_points, atr * InpATR_TS_Step_Multiplier);
+        double atr_points = g_current_atr_value / point_value;
+        effective_be_points = MathMax(effective_be_points, atr_points * InpATR_BE_Profit_Multiplier);
+        effective_be_offset_points = MathMax(effective_be_offset_points, atr_points * InpATR_BE_Offset_Multiplier);
+        effective_trailing_stop_points = MathMax(effective_trailing_stop_points, atr_points * InpATR_TS_Distance_Multiplier);
+        effective_trailing_step_points = MathMax(effective_trailing_step_points, atr_points * InpATR_TS_Step_Multiplier);
     }
 
-    bool skip_be_logic = false;
-    if(InpBlockOpenTradesWithRoblixSignal) {
-        bool roblixActive=false;
-        if(pos_type==POSITION_TYPE_BUY && hasBuySignalFromRoblix) roblixActive=true;
-        if(pos_type==POSITION_TYPE_SELL && hasSellSignalFromRoblix) roblixActive=true;
-        if(InpUseRSICrossFilter) {
-            if(pos_type==POSITION_TYPE_BUY && g_rsiCrossedDown) roblixActive=false;
-            if(pos_type==POSITION_TYPE_SELL && g_rsiCrossedUp) roblixActive=false;
-        }
-        if(roblixActive) skip_be_logic = true;
-    }
+    int digits = (int)SymbolInfoInteger(Symbol(), SYMBOL_DIGITS);
+    int stops_level_points = (int)SymbolInfoInteger(Symbol(), SYMBOL_TRADE_STOPS_LEVEL);
+    int freeze_level_points = (int)SymbolInfoInteger(Symbol(), SYMBOL_TRADE_FREEZE_LEVEL);
+    double bid = SymbolInfoDouble(Symbol(), SYMBOL_BID);
+    double ask = SymbolInfoDouble(Symbol(), SYMBOL_ASK);
 
-    if(!skip_be_logic && effective_be_points>0 && profit_in_points>=effective_be_points) {
+    if(effective_be_points>0 && profit_in_points>=effective_be_points) {
         double breakeven_price = 0.0;
         if(pos_type==POSITION_TYPE_BUY) breakeven_price = entry_price + effective_be_offset_points*point_value;
         else breakeven_price = entry_price - effective_be_offset_points*point_value;
-        int digits = (int)SymbolInfoInteger(Symbol(), SYMBOL_DIGITS);
         breakeven_price = NormalizeDouble(breakeven_price, digits);
         double cur_sl = PositionGetDouble(POSITION_SL);
         bool should_move = false;
@@ -675,8 +670,20 @@ void ManageTrailingStop(bool hasBuySignalFromRoblix, bool hasSellSignalFromRobli
             if(pos_type==POSITION_TYPE_SELL && breakeven_price < cur_sl && (cur_sl - breakeven_price) >= effective_trailing_step_points*point_value) should_move = true;
         }
         if(should_move) {
-            if(m_trade.PositionModify((ulong)PositionGetInteger(POSITION_TICKET), breakeven_price, PositionGetDouble(POSITION_TP))) {
-                if(InpDebugMode) PrintFormat("Moved SL to breakeven: %.5f", breakeven_price);
+            bool stop_distance_ok = (pos_type==POSITION_TYPE_BUY)
+                                    ? (bid - breakeven_price) / point_value >= stops_level_points
+                                    : (breakeven_price - ask) / point_value >= stops_level_points;
+            bool freeze_ok = (pos_type==POSITION_TYPE_BUY)
+                             ? (bid - breakeven_price) / point_value >= freeze_level_points
+                             : (breakeven_price - ask) / point_value >= freeze_level_points;
+            if(stop_distance_ok && freeze_ok) {
+                if(m_trade.PositionModify((ulong)PositionGetInteger(POSITION_TICKET), breakeven_price, PositionGetDouble(POSITION_TP))) {
+                    if(InpDebugMode) PrintFormat("Moved SL to breakeven: %.5f", breakeven_price);
+                } else if(InpDebugMode) {
+                    PrintFormat("Failed to move SL to breakeven. Retcode=%d Error=%d", m_trade.ResultRetcode(), GetLastError());
+                }
+            } else if(InpDebugMode) {
+                PrintFormat("Skipped breakeven modify due to stop/freeze levels. SL=%.5f stops=%d freeze=%d", breakeven_price, stops_level_points, freeze_level_points);
             }
         }
     }
@@ -685,7 +692,6 @@ void ManageTrailingStop(bool hasBuySignalFromRoblix, bool hasSellSignalFromRobli
         double new_sl = 0.0;
         if(pos_type==POSITION_TYPE_BUY) new_sl = SymbolInfoDouble(Symbol(), SYMBOL_BID) - effective_trailing_stop_points*point_value;
         else new_sl = SymbolInfoDouble(Symbol(), SYMBOL_ASK) + effective_trailing_stop_points*point_value;
-        int digits = (int)SymbolInfoInteger(Symbol(), SYMBOL_DIGITS);
         new_sl = NormalizeDouble(new_sl, digits);
         double cur_sl = PositionGetDouble(POSITION_SL);
         bool modify=false;
@@ -695,8 +701,20 @@ void ManageTrailingStop(bool hasBuySignalFromRoblix, bool hasSellSignalFromRobli
             if(pos_type==POSITION_TYPE_SELL && new_sl < cur_sl && (cur_sl - new_sl) >= effective_trailing_step_points*point_value) modify=true;
         }
         if(modify) {
-            if(m_trade.PositionModify((ulong)PositionGetInteger(POSITION_TICKET), new_sl, PositionGetDouble(POSITION_TP))) {
-                if(InpDebugMode) PrintFormat("Trailing moved SL to %.5f", new_sl);
+            bool stop_distance_ok = (pos_type==POSITION_TYPE_BUY)
+                                    ? (bid - new_sl) / point_value >= stops_level_points
+                                    : (new_sl - ask) / point_value >= stops_level_points;
+            bool freeze_ok = (pos_type==POSITION_TYPE_BUY)
+                             ? (bid - new_sl) / point_value >= freeze_level_points
+                             : (new_sl - ask) / point_value >= freeze_level_points;
+            if(stop_distance_ok && freeze_ok) {
+                if(m_trade.PositionModify((ulong)PositionGetInteger(POSITION_TICKET), new_sl, PositionGetDouble(POSITION_TP))) {
+                    if(InpDebugMode) PrintFormat("Trailing moved SL to %.5f", new_sl);
+                } else if(InpDebugMode) {
+                    PrintFormat("Failed to trail SL. Retcode=%d Error=%d", m_trade.ResultRetcode(), GetLastError());
+                }
+            } else if(InpDebugMode) {
+                PrintFormat("Skipped trailing modify due to stop/freeze levels. SL=%.5f stops=%d freeze=%d", new_sl, stops_level_points, freeze_level_points);
             }
         }
     }
